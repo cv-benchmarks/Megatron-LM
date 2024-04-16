@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import contextmanager
+from logging import getLogger
 from typing import Dict, Optional
 
 import torch
@@ -8,7 +9,10 @@ import torch
 from .. import parallel_state
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
-from .grad_buffer import GradBuffer
+from .distributed_data_parallel_config import DistributedDataParallelConfig
+from .param_and_grad_buffer import ParamAndGradBuffer
+
+logger = getLogger(__name__)
 
 
 class DistributedDataParallel(MegatronModule):
@@ -19,17 +23,12 @@ class DistributedDataParallel(MegatronModule):
     also provides the option to do the gradient accumulation in a type other than the param type
     (e.g., fp32 for a bf16 model).
 
-    Arguments:
+    Args:
         config: Transformer config object.
+        ddp_config: DistributedDataParallel config object.
         module: Underlying model.
         data_parallel_group: Data-parallel process group.
-        accumulate_allreduce_grads_in_fp32: If true, do the gradient accumulation and
-            communication in fp32.
-        overlap_grad_reduce: If true, overlap communication with backprop computation by
-            breaking up grads into buckets. If false, single synchronous communication call
-            is used instead.
-        use_distributed_optimizer: If true, issue reduce-scatter communication calls as part
-            of distributed optimizer. If false, issue all-reduce communication calls.
+        expert_data_parallel_group: Optional data-parallel process group for experts in a MoE.
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
@@ -40,40 +39,44 @@ class DistributedDataParallel(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
+        ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
         data_parallel_group: torch.distributed.ProcessGroup,
-        accumulate_allreduce_grads_in_fp32: bool,
-        overlap_grad_reduce: bool,
-        use_distributed_optimizer: bool,
         expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         disable_bucketing: bool = False,
-        check_for_nan_in_grad: bool = False,
-        bucket_size: int = 40000000,
     ):
         super().__init__(config=config)
         self.module = module
 
+        # If bucket_size is not provided as an input, use sane default.
+        # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
+        # ring-reduce implementations are large enough to remain bandwidth-bound rather than
+        # latency-bound.
+        if ddp_config.bucket_size is None:
+            dp_size = parallel_state.get_data_parallel_world_size()
+            ddp_config.bucket_size = max(40000000, 1000000 * dp_size)
         # Set bucket_size to infinity if overlap_grad_reduce is False.
-        self.overlap_grad_reduce = overlap_grad_reduce
-        self.use_distributed_optimizer = use_distributed_optimizer
+        if not ddp_config.overlap_grad_reduce:
+            ddp_config.bucket_size = None
 
-        # Turn off bucketing if overlap_grad_reduce is False, if we are on a pipeline stage
-        # that is not the first (since data-parallel communication on these stages is not on
-        # the critical path), or if disable_bucketing is True (e.g., we might not want to
-        # break up model parameters into buckets for model chunks after the first
-        # in the interleaved schedule).
-        if not self.overlap_grad_reduce:
-            bucket_size = None
+        self.ddp_config = ddp_config
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info(
+                f'Setting up DistributedDataParallel with {type(self.ddp_config).__name__}: {self.ddp_config}'
+            )
+
+        # Turn off bucketing if we are on a pipeline stage that is not the first (since
+        # data-parallel communication on these stages is not on the critical path), or if
+        # disable_bucketing is True (e.g., we might not want to break up model parameters
+        # into buckets for model chunks after the first in the interleaved schedule).
+        self.bucket_size = self.ddp_config.bucket_size
         if parallel_state.get_pipeline_model_parallel_rank() > 0:
-            bucket_size = None
+            self.bucket_size = None
         if disable_bucketing:
-            bucket_size = None
-
-        self.check_for_nan_in_grad = check_for_nan_in_grad
-        self.bucket_size = bucket_size
+            self.bucket_size = None
 
         self.module = module
-        self.param_to_grad_buffer = {}
+        self.param_to_buffer = {}
 
         # Group parameters by their gradient type.
         param_to_name = {}
@@ -91,58 +94,71 @@ class DistributedDataParallel(MegatronModule):
             else:
                 expert_parallel_params.append(param)
 
-        def allocate_grad_buffers_for_parameters(
+        def allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor=1.0,
         ):
-            grad_dtype_to_params = {}
+            param_and_grad_dtype_to_params = {}
 
             # Group parameters by their gradient type.
             for param in input_params:
                 if not param.requires_grad:
                     continue
 
-                dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
+                param_dtype = param.dtype
+                grad_dtype = torch.float if self.ddp_config.grad_reduce_in_fp32 else param.dtype
 
-                params = grad_dtype_to_params.get(dtype, [])
+                params = param_and_grad_dtype_to_params.get((param_dtype, grad_dtype), [])
                 params.append(param)
-                grad_dtype_to_params[dtype] = params
+                param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
 
             # Allocate the grad buffers and map the grads.
-            grad_buffers = []
-            for dtype, params in grad_dtype_to_params.items():
-                grad_buffers.append(
-                    GradBuffer(
-                        dtype,
+            buffers = []
+            for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
+                buffers.append(
+                    ParamAndGradBuffer(
+                        self.ddp_config,
+                        param_dtype,
+                        grad_dtype,
                         params,
                         data_parallel_group,
-                        bucket_size,
+                        self.bucket_size,
                         param_to_name,
-                        self.overlap_grad_reduce,
-                        self.use_distributed_optimizer,
                         gradient_scaling_factor,
-                        self.check_for_nan_in_grad,
                     )
                 )
                 for param in params:
-                    self.param_to_grad_buffer[param] = grad_buffers[-1]
+                    self.param_to_buffer[param] = buffers[-1]
 
-            return grad_buffers
+            return buffers
 
         data_parallel_world_size = torch.distributed.get_world_size(data_parallel_group)
 
-        # Allocate the grad buffers for dense params' grads.
-        self.grad_buffers = allocate_grad_buffers_for_parameters(
+        # Allocate the param+grad buffers for dense params' grads.
+        self.buffers = allocate_buffers_for_parameters(
             dense_params,
             data_parallel_group,
             gradient_scaling_factor=1.0 / data_parallel_world_size,
         )
 
-        # Allocate separate grad buffers for expert parallel params' grads.
-        self.expert_parallel_grad_buffers = allocate_grad_buffers_for_parameters(
+        # Allocate separate param+grad buffers for expert parallel params' grads.
+        self.expert_parallel_buffers = allocate_buffers_for_parameters(
             expert_parallel_params,
             expert_data_parallel_group,
             gradient_scaling_factor=1.0 / data_parallel_world_size,
         )
+
+        # Delete references to weight_tensor if they exist since we don't want two parameter copies
+        # if we re-mapped parameters (which happens when we use the distributed optimizer).
+        # This is a temporary workaround around a TE bug that is fixed with
+        # https://github.com/NVIDIA/TransformerEngine/pull/719.
+        if self.ddp_config.use_distributed_optimizer:
+
+            @torch.no_grad()
+            def unmap_weight_tensor(m):
+                if hasattr(m, 'weight_tensor'):
+                    m.weight_tensor = None
+
+            self.module.apply(unmap_weight_tensor)
 
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
@@ -154,7 +170,7 @@ class DistributedDataParallel(MegatronModule):
                 param_tmp = param.expand_as(param)
                 # Get the gradient accumulator function.
                 grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                grad_acc.register_hook(self._make_param_hook(param, self.param_to_grad_buffer))
+                grad_acc.register_hook(self._make_param_hook(param, self.param_to_buffer))
                 self.grad_accs.append(grad_acc)
 
     def forward(self, *inputs, **kwargs):
@@ -164,7 +180,9 @@ class DistributedDataParallel(MegatronModule):
         return self.module(*inputs, **kwargs)
 
     def _make_param_hook(
-        self, param: torch.nn.Parameter, param_to_grad_buffer: Dict[torch.nn.Parameter, GradBuffer]
+        self,
+        param: torch.nn.Parameter,
+        param_to_buffer: Dict[torch.nn.Parameter, ParamAndGradBuffer],
     ):
         """
         Creates the all-reduce / reduce-scatter hook for backprop.
@@ -172,7 +190,7 @@ class DistributedDataParallel(MegatronModule):
 
         def param_hook(*unused):
             if param.requires_grad:
-                if self.overlap_grad_reduce:
+                if self.ddp_config.overlap_grad_reduce:
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
@@ -182,8 +200,8 @@ class DistributedDataParallel(MegatronModule):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
 
-                if self.overlap_grad_reduce:
-                    param_to_grad_buffer[param].register_grad_ready(param)
+                if self.ddp_config.overlap_grad_reduce:
+                    param_to_buffer[param].register_grad_ready(param)
 
         return param_hook
 
@@ -192,13 +210,13 @@ class DistributedDataParallel(MegatronModule):
         """
         Context manager that turns off gradient synchronization.
         """
-        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-            grad_buffer.is_last_microbatch = False
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.is_last_microbatch = False
         try:
             yield
         finally:
-            for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-                grad_buffer.is_last_microbatch = True
+            for buffer in self.buffers + self.expert_parallel_buffers:
+                buffer.is_last_microbatch = True
 
     def start_grad_sync(self, *unused):
         """
@@ -209,8 +227,8 @@ class DistributedDataParallel(MegatronModule):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-            grad_buffer.start_grad_sync()
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.start_grad_sync()
 
     def finish_grad_sync(self):
         """
@@ -221,21 +239,19 @@ class DistributedDataParallel(MegatronModule):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-            grad_buffer.finish_grad_sync()
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.finish_grad_sync()
 
-    def zero_grad_buffer(self, zero_buffer):
+    def zero_grad_buffer(self):
         """
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
-
-        When zero_buffer is set to True, the underlying grad buffer is zeroed out.
         """
         for param in self.module.parameters():
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
-        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-            grad_buffer.reset(zero_buffer)
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.reset()
 
     def broadcast_params(self):
         """
