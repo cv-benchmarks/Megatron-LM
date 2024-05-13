@@ -117,7 +117,8 @@ class Bucket:
                 f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
             )
 
-        self.grad_data *= self.gradient_scaling_factor
+        if self.gradient_scaling_factor != 1.0:
+            self.grad_data *= self.gradient_scaling_factor
         # Use async_op only when overlap_grad_reduce is True.
         if self.ddp_config.use_distributed_optimizer:
             local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
@@ -318,8 +319,13 @@ class ParamAndGradBuffer:
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
         self.numel = data_end_index
+        self.numel_unpadded = sum(per_bucket_numel_unpadded)
+        assert self.numel_unpadded <= self.numel
         if self.ddp_config.use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
+        else:
+            assert self.numel == self.numel_unpadded
+
         self.param_data = None
         # Only re-map param tensors if using distributed optimizer.
         if self.ddp_config.use_distributed_optimizer:
@@ -401,6 +407,10 @@ class ParamAndGradBuffer:
                 logger.info(f'Params for bucket {index+1} ({numel} elements):')
                 for param in bucket.params:
                     logger.info(f'    {param_to_name[param]}')
+
+    def scale_gradients(self, scaling_factor: float) -> None:
+        """Scale the gradient data by `scaling_factor`."""
+        self.grad_data *= scaling_factor
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """
