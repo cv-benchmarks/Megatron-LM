@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 from megatron import core
-from megatron.training import get_timers, get_args, get_num_microbatches
+from megatron.training import get_timers, get_args
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
@@ -18,6 +18,7 @@ from megatron.legacy.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding, apply_rotary_pos_emb
+from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.legacy.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_norm
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region_to_moe,
@@ -1517,8 +1518,11 @@ class ParallelTransformer(MegatronModule):
                     layer_number=layer_number,
                     kv_channels=config.kv_channels,
                     self_attn_mask_type=self_attn_mask_type.name,
-                    tp_group=mpu.get_tensor_model_parallel_group(),
-                    get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
+                    tp_group=mpu.get_tensor_model_parallel_group() if mpu.is_initialized() else None,
+                    tp_size=mpu.get_tensor_model_parallel_world_size(),
+                    get_rng_state_tracker=get_cuda_rng_tracker
+                    if get_cuda_rng_tracker().is_initialized()
+                    else None,
                     fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                     seq_length=args.seq_length,
                     micro_batch_size=args.micro_batch_size,
