@@ -80,8 +80,19 @@ def num_floating_point_operations(args, batch_size):
     # MoE.
     num_experts_routed_to = 1 if args.num_experts is None else args.moe_router_topk
     gated_linear_multiplier = 3 / 2 if args.swiglu else 1
+
+    # The 12x term below comes from the following factors; for more details, see
+    # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
+    # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
+    #       backward wgrad [weight gradient], backward dgrad [data gradient]).
+    # - 2x: GEMMs of a particular size are stacked twice in the standard Transformer model
+    #       architectures implemented in this codebase (e.g., h->ffn_h GEMM and ffn_h->h GEMM
+    #       in MLP layer).
+    # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
+    expansion_factor = 3 * 2 * 2
+
     return (
-        12
+        expansion_factor
         * batch_size
         * args.seq_length
         * args.num_layers
@@ -153,13 +164,17 @@ def get_start_time_from_progress_log():
         start_num_floating_point_operations
 
 
-def pretrain(train_valid_test_dataset_provider,
-             model_provider,
-             model_type,
-             forward_step_func,
-             process_non_loss_data_func=None,
-             extra_args_provider=None,
-             args_defaults={}):
+def pretrain(
+    train_valid_test_dataset_provider,
+    model_provider,
+    model_type,
+    forward_step_func,
+    process_non_loss_data_func=None,
+    extra_args_provider=None,
+    args_defaults={},
+    get_embedding_ranks=None,
+    get_position_embedding_ranks=None,
+):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -190,8 +205,12 @@ def pretrain(train_valid_test_dataset_provider,
     """
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(extra_args_provider=extra_args_provider,
-                        args_defaults=args_defaults)
+    initialize_megatron(
+        extra_args_provider=extra_args_provider,
+        args_defaults=args_defaults,
+        get_embedding_ranks=get_embedding_ranks,
+        get_position_embedding_ranks=get_position_embedding_ranks
+    )
 
     args = get_args()
     timers = get_timers()
@@ -299,7 +318,8 @@ def pretrain(train_valid_test_dataset_provider,
 
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                            num_floating_point_operations_so_far, checkpointing_context)
+                            num_floating_point_operations_so_far, checkpointing_context,
+                            train_data_iterator=train_data_iterator)
 
         one_logger and one_logger.log_metrics({
             'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -391,16 +411,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         add_decoder = True
         if model_type == ModelType.encoder_and_decoder:
             if mpu.get_pipeline_model_parallel_world_size() > 1:
-                assert args.pipeline_model_parallel_split_rank is not None, \
-                    "Split rank needs to be specified for model with both encoder and decoder"
                 rank = mpu.get_pipeline_model_parallel_rank()
-                split_rank = args.pipeline_model_parallel_split_rank
+                first_decoder_rank = args.encoder_pipeline_model_parallel_size
                 world_size = mpu.get_pipeline_model_parallel_world_size()
-                pre_process = rank == 0 or rank == split_rank
-                post_process = (rank == (split_rank - 1)) or (
-                        rank == (world_size - 1))
-                add_encoder = mpu.is_pipeline_stage_before_split()
-                add_decoder = mpu.is_pipeline_stage_after_split()
+                pre_process = rank == 0 or rank == first_decoder_rank
+                post_process = (rank == (first_decoder_rank - 1)) or (rank == (world_size - 1))
+                add_encoder = mpu.is_inside_encoder(rank)
+                add_decoder = mpu.is_inside_decoder(rank)
             model = model_provider_func(
                 pre_process=pre_process,
                 post_process=post_process,
@@ -920,7 +937,8 @@ def compute_throughputs_and_append_to_progress_log(iteration,
 
 
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
-                             num_floating_point_operations_so_far, checkpointing_context):
+                             num_floating_point_operations_so_far, checkpointing_context,
+                             non_persistent_ckpt=False, train_data_iterator=None):
     args = get_args()
     timers = get_timers()
 
@@ -928,7 +946,8 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     timers('interval-time').stop()
 
     # Extra barrier is added to make sure all ranks report the max time.
-    timers('save-checkpoint', log_level=0).start(barrier=True)
+    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
+    timers(timer_key, log_level=0).start(barrier=True)
     save_checkpoint_start_time = timers('save-checkpoint').active_time()
 
     # Log E2E metrics before save-checkpoint
@@ -937,11 +956,12 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.disable_pre_hook()
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                    num_floating_point_operations_so_far, checkpointing_context)
+                    num_floating_point_operations_so_far, checkpointing_context,
+                    non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator)
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.enable_pre_hook()
-    timers('save-checkpoint').stop(barrier=True)
-    timers.log(['save-checkpoint'])
+    timers(timer_key).stop(barrier=True)
+    timers.log([timer_key])
     save_checkpoint_finish_time = timers('save-checkpoint').active_time()
 
     # Log E2E metrics after save-checkpoint
@@ -949,8 +969,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     save_checkpoint_duration = save_checkpoint_finish_time - save_checkpoint_start_time
     one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
-
-    if args.log_progress:
+    if args.log_progress and not non_persistent_ckpt:
         compute_throughputs_and_append_to_progress_log(iteration,
                                                        num_floating_point_operations_so_far)
 
@@ -1077,7 +1096,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
                                      num_floating_point_operations_so_far,
-                                     checkpointing_context)
+                                     checkpointing_context, train_data_iterator=train_data_iterator)
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True)
 
@@ -1175,7 +1194,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
                                          num_floating_point_operations_so_far,
-                                         checkpointing_context)
+                                         checkpointing_context, train_data_iterator=train_data_iterator)
                 print_datetime('exiting program after receiving SIGTERM.')
                 exit = True
                 break
@@ -1185,8 +1204,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
                                      num_floating_point_operations_so_far,
-                                     checkpointing_context)
+                                     checkpointing_context, train_data_iterator=train_data_iterator)
             saved_checkpoint = True
+
+        elif args.save and args.non_persistent_save_interval and \
+           iteration % args.non_persistent_save_interval == 0:
+            timers('interval-time').stop()
+            save_checkpoint_and_time(iteration, model, optimizer,
+                                     opt_param_scheduler,
+                                     num_floating_point_operations_so_far,
+                                     non_persistent_ckpt=True, train_data_iterator=train_data_iterator)
+            saved_checkpoint = True
+            timers('interval-time', log_level=0).start(barrier=True)
 
         # Exiting based on duration
         if args.exit_duration_in_mins:
@@ -1202,7 +1231,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler,
                                              num_floating_point_operations_so_far,
-                                             checkpointing_context)
+                                             checkpointing_context, train_data_iterator=train_data_iterator)
                 print_datetime('exiting program after {} minutes'.format(train_time))
                 exit = True
                 break
@@ -1213,7 +1242,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
                                          num_floating_point_operations_so_far,
-                                         checkpointing_context)
+                                         checkpointing_context, train_data_iterator=train_data_iterator)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             exit = True

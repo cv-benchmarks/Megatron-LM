@@ -151,6 +151,10 @@ def load_retro_args(args):
 
 def validate_args(args, defaults={}):
 
+    # Temporary
+    assert args.non_persistent_ckpt_type in ['global', None], \
+        'Currently only global checkpoints are supported'
+
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
 
@@ -189,10 +193,14 @@ def validate_args(args, defaults={}):
                   args.context_parallel_size,
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
+
+    if args.pipeline_model_parallel_split_rank is not None:
+        args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
+
     if args.pipeline_model_parallel_size > 1:
-        if args.pipeline_model_parallel_split_rank is not None:
-            assert args.pipeline_model_parallel_split_rank < \
-                    args.pipeline_model_parallel_size, 'split rank needs'\
+        if args.encoder_pipeline_model_parallel_size is not None:
+            assert args.encoder_pipeline_model_parallel_size < \
+                    args.pipeline_model_parallel_size, 'encoder pipeline size needs '\
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
 
@@ -1282,8 +1290,8 @@ def _add_checkpointing_args(parser):
 
     group.add_argument('--save', type=str, default=None,
                        help='Output directory to save checkpoints to.')
-    group.add_argument('--save-interval', type=int, default=None,
-                       help='Number of iterations between checkpoint saves.')
+    group.add_argument('--save-interval', '--persistent-save-interval', type=int, default=None,
+                       help='Number of iterations between persistent checkpoint saves.')
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,
@@ -1294,6 +1302,17 @@ def _add_checkpointing_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--non-persistent-save-interval', type=int, default=None,
+                       help='Number of iterations between non-persistent saves.')
+    group.add_argument('--non-persistent-ckpt-type', type=str, default=None,
+                       choices=['global', 'local', 'in_memory', None],
+                       help='Type of non-persistent model checkpoints. '
+                           '"global" - Saved as a standard checkpoint (e.g., on Lustre) with old checkpoints being removed. '
+                           '"local" - [TBD] Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk). '
+                           '"in_memory" - [TBD] A special kind of local checkpoint that avoids serialization. '
+                           'None - No non-persistent checkpointing (default option).')
+    group.add_argument('--non-persistent-global-ckpt-dir', type=str, default=None,
+                       help='Directory containing global non-persistent model checkpoints.')
     group.add_argument('--finetune', action='store_true',
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
@@ -1394,9 +1413,12 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--encoder-pipeline-model-parallel-size', type=int, default=None,
+                       help='Degree of pipeline model parallelism in the encoder.')
     group.add_argument('--pipeline-model-parallel-split-rank',
                        type=int, default=None,
-                       help='Rank where encoder and decoder should be split.')
+                       help=('Rank where encoder and decoder should be split. '
+                             'Deprecated; use --encoder-pipeline-model-parallel-size instead.'))
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
