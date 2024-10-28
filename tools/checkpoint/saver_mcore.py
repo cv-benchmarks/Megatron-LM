@@ -51,7 +51,7 @@ class MCoreSetter(ModelSetter):
         model,
         emb=None,
     ):
-        cls.set_tensor(model.embedding.word_embeddings.weight, emb)
+        cls.set_tensor(model.output_layer.weight, emb)
 
     @classmethod
     def set_output_layer(
@@ -389,7 +389,8 @@ def save_checkpoint(queue, args):
                 '--no-save-rng',
                 '--no-initialization',
                 '--save-interval', '1',
-                '--save', args.save_dir
+                '--save', args.save_dir,
+                '--ckpt-format', 'torch', # only 'torch' supported for conversion
                 ]
 
     if md.make_vocab_size_divisible_by is not None:
@@ -424,7 +425,9 @@ def save_checkpoint(queue, args):
                         'encoder_num_layers', 'encoder_seq_length',
                         'distribute_saved_activations',
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
-                        'start_weight_decay', 'end_weight_decay']
+                        'start_weight_decay', 'end_weight_decay',
+                        'ckpt_format',
+        ]
 
         for arg, value in vars(md.checkpoint_args).items():
             if arg in args_to_keep:
@@ -599,6 +602,7 @@ def save_checkpoint(queue, args):
     # ------------------
     total_layer_num = 0
     for pp_rank in range(args.target_pipeline_parallel_size):
+        mpu.set_pipeline_model_parallel_rank(pp_rank)
         # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
         get_local_model(pp_rank,0,0)
         for layer_id in range(len(setter.get_transformer_block(models[pp_rank][0][0]).layers)):
@@ -627,10 +631,11 @@ def save_checkpoint(queue, args):
             else:
                 mlp_l0_weight = chunk_weight(msg.pop("mlp l0 weight"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
 
+            if md.qkv_bias:
+                qkv_bias = chunk_bias(msg.pop("qkv bias"), 'column', args.target_tensor_parallel_size)
             if md.linear_bias:
                 dense_bias = msg.pop("dense bias")
                 mlp_l1_bias = chunk_bias(msg.pop("mlp l1 bias"), 'row', args.target_tensor_parallel_size, args.target_expert_parallel_size)
-                qkv_bias = chunk_bias(msg.pop("qkv bias"), 'column', args.target_tensor_parallel_size)
                 if md.swiglu:
                     mlp_l0_bias_W = chunk_bias(msg.pop("mlp l0 bias W"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
                     mlp_l0_bias_V = chunk_bias(msg.pop("mlp l0 bias V"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
@@ -661,9 +666,12 @@ def save_checkpoint(queue, args):
                         "self_attn_norm_bias" : input_norm_bias if md.norm_has_bias else None,
                         "mlp_norm_bias" : post_norm_bias if md.norm_has_bias else None,
                     })
+                    if md.qkv_bias:
+                        params_dict.update({
+                            "self_attn_qkv_bias" : qkv_bias[tp_rank]
+                        })
                     if md.linear_bias:
                         params_dict.update({
-                            "self_attn_qkv_bias" : qkv_bias[tp_rank],
                             "self_attn_proj_bias" : dense_bias
                         })
                         if margs.num_experts:
